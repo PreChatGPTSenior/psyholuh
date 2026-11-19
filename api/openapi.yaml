@@ -11,6 +11,29 @@ info:
 servers:
   - url: /api
 paths:
+  /settings/budget:
+    get:
+      operationId: getBudget
+      responses:
+        '200': {$ref: '#/components/responses/Budget'}
+    put:
+      operationId: setBudget
+      description: |
+        Set the total USD ceiling for this installation's recorded OpenRouter
+        spend. Zero pauses paid calls. Decimal dollars are transmitted as strings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [limit_usd]
+              properties:
+                limit_usd: {$ref: '#/components/schemas/Usd'}
+            example: {limit_usd: '5.00'}
+      responses:
+        '200': {$ref: '#/components/responses/Budget'}
+        default: {$ref: '#/components/responses/Error'}
   /health:
     get:
       operationId: getHealth
@@ -123,6 +146,10 @@ paths:
         A disconnect before done may require a retry to reconcile the response.
         After the stream starts, failures use an error event; JSON errors apply
         before the stream starts. New submissions require the active chat.
+        A paid reply or required compression can emit retryable budget_required,
+        budget_exceeded or budget_pricing_unavailable. The same request_id may
+        be retried after the budget or prices are available. A completed replay
+        only returns saved messages and does not reserve money again.
       requestBody:
         required: true
         content:
@@ -229,11 +256,28 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Memory'}
         default: {$ref: '#/components/responses/Error'}
+  /chats/{chat_id}/costs:
+    parameters:
+      - $ref: '#/components/parameters/ChatId'
+    get:
+      operationId: getChatCosts
+      responses:
+        '200':
+          description: Confirmed provider charges and outstanding reservations for this chat.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ChatCosts'}
+        default: {$ref: '#/components/responses/Error'}
 components:
   parameters:
     ChatId: {in: path, name: chat_id, required: true, schema: {type: string}}
     JobId: {in: path, name: job_id, required: true, schema: {type: string}}
   responses:
+    Budget:
+      description: Current global budget, confirmed cost and pending reservations.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Budget'}
     Chat:
       description: Active chat with the model it was created with.
       content:
@@ -250,6 +294,42 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
   schemas:
+    Usd:
+      type: string
+      pattern: '^[0-9]+(?:\.[0-9]{1,9})?$'
+      description: Nonnegative US dollars with up to nine decimal places. No exponent or symbol.
+    Budget:
+      type: object
+      required: [limit_usd, spent_usd, reserved_usd, available_usd]
+      properties:
+        limit_usd:
+          anyOf: [{$ref: '#/components/schemas/Usd'}, {type: 'null'}]
+          description: Null before the user configures a ceiling. Paid calls are paused until set.
+        spent_usd: {$ref: '#/components/schemas/Usd'}
+        reserved_usd: {$ref: '#/components/schemas/Usd'}
+        available_usd:
+          anyOf: [{$ref: '#/components/schemas/Usd'}, {type: 'null'}]
+          description: Limit minus confirmed spend and unresolved reservations, clamped at zero. Null when unset.
+    ChatCosts:
+      type: object
+      required: [total_usd, replies_usd, compression_usd, reserved_usd, last_reply]
+      properties:
+        total_usd: {$ref: '#/components/schemas/Usd'}
+        replies_usd: {$ref: '#/components/schemas/Usd'}
+        compression_usd: {$ref: '#/components/schemas/Usd'}
+        reserved_usd: {$ref: '#/components/schemas/Usd'}
+        last_reply:
+          anyOf: [{$ref: '#/components/schemas/ReplyCost'}, {type: 'null'}]
+          description: Latest completed assistant reply by seq. Null when no answer exists.
+    ReplyCost:
+      type: object
+      required: [message_id, cost_usd, pending]
+      properties:
+        message_id: {type: string}
+        cost_usd:
+          anyOf: [{$ref: '#/components/schemas/Usd'}, {type: 'null'}]
+          description: Provider-reported charge for its completed generation. Null while awaiting accounting or for historic replies with no cost recorded.
+        pending: {type: boolean, description: A provider charge for this generation is awaiting reconciliation.}
     Model:
       type: object
       required: [id, label]
