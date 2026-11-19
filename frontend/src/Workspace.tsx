@@ -6,9 +6,11 @@ import {
 import Markdown from 'react-markdown'
 import { Brand, EmptyState, Notice } from './components'
 import { MemoryPanel } from './Memory'
-import { errorText, type AudioJob, type Chat, type ChatApi, type Message, type Mode, type Source, type Submission } from './api'
+import { errorText, type AudioJob, type Budget, type Chat, type ChatApi, type Message, type Mode, type Source, type Submission } from './api'
 import { useAudio } from './audio'
 import { reconstructSubmission, useTimeline } from './timeline'
+import { BudgetButton, BudgetPrompt, ChatCostBar } from './Budget'
+import { budgetError, useChatCosts } from './finance'
 
 type Props = {
   api: ChatApi
@@ -18,6 +20,8 @@ type Props = {
   modelLabel: string
   demo: boolean
   scope: string
+  budget: Budget | null
+  onBudget: () => void
   onMenu: () => void
   onRecording: (recording: boolean) => void
   onAccepted: (submission: Submission) => void
@@ -55,7 +59,7 @@ function Turn({ id, speaker, role, timestamp, children }: {
   </article>
 }
 
-export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope, onMenu, onRecording, onAccepted }: Props) {
+export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope, budget, onBudget, onMenu, onRecording, onAccepted }: Props) {
   const [mode, setMode] = useState<Mode>(chat.mode)
   const [text, setText] = useState('')
   const [memoryOpen, setMemoryOpen] = useState(false)
@@ -75,6 +79,8 @@ export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope,
   }, () => setRevision((count) => count + 1))
   const current = timeline.attempt
   const busy = !!current && current.phase !== 'failed'
+  const latestReply = timeline.messages.findLast((message) => message.role === 'assistant' && message.status === 'complete')?.id
+  const costs = useChatCosts(api, chat.id, visible, busy, revision, latestReply)
   const unresolved = !!current || timeline.messages.some((message) => message.status === 'streaming')
   const canSubmit = timeline.ready && !unresolved && !moving && !audio.recording
   const canRecord = !moving && !audio.busy && !audio.pendingRecording
@@ -149,8 +155,10 @@ export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope,
     return <Turn key={reply?.id ?? 'pending-assistant'} id={reply && `turn-${reply.id}`} role="assistant" speaker={modelLabel} timestamp={reply?.created_at}>
       {attempt.text && <MessageBody>{attempt.text}</MessageBody>}
       {attempt.phase === 'failed' ? <div className="attempt-error">
-        <p role="alert">{attempt.error || phases.failed}</p>
+        <p role="alert">{budgetError(attempt.errorCode) || attempt.error || phases.failed}</p>
         <div className="turn-actions">
+          {(attempt.errorCode === 'budget_required' || attempt.errorCode === 'budget_exceeded') &&
+            <button type="button" className="text-button" onClick={onBudget}>Изменить бюджет</button>}
           {attempt.retryable && <button type="button" className="text-button" disabled={moving}
             onClick={() => { follow.current = true; void timeline.send(attempt.submission) }}><RotateCcw size={15} /> Повторить ответ</button>}
           {(requestUser || requestReply) ? <button type="button" className="text-button" onClick={timeline.dismissAttempt}>Закрыть сообщение</button>
@@ -212,18 +220,21 @@ export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope,
 
   const hasTurns = timeline.messages.length > 0 || !!current
   return <section className="workspace" hidden={!visible} aria-label={chat.title}>
-    <header className="topbar">
+    <header className="topbar chat-topbar">
       <button className="icon-button menu-toggle" aria-label="Открыть список бесед" type="button" onClick={onMenu}><Menu size={22} /></button>
       <div className="topbar-chat">
         <span className="topbar-icon"><MessageCircle size={20} strokeWidth={1.7} /></span>
         <div><h2>{chat.title}</h2><p title={chat.model_id}>{modelLabel}</p></div>
       </div>
+      <ChatCostBar costs={costs.value} error={costs.error} latestReply={latestReply} />
       <div className="topbar-actions">
         {demo && <span className="demo-tag" title="Вымышленные данные">ДЕМО</span>}
         <button className="secondary-button memory-toggle" type="button" aria-expanded={memoryOpen}
-          onClick={() => setMemoryOpen(!memoryOpen)}><BookOpen size={17} /> <span>Память</span></button>
+          aria-label="Память" onClick={() => setMemoryOpen(!memoryOpen)}><BookOpen size={17} /> <span>Память</span></button>
+        <BudgetButton open={onBudget} />
       </div>
     </header>
+    {!demo && <BudgetPrompt budget={budget} open={onBudget} />}
     <div className="workspace-columns">
       <div className="conversation">
         <div className="conversation-scroll" ref={scroll} onScroll={(event) => {
