@@ -1,9 +1,11 @@
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Iterable
 
 from . import config
+from .budget import BudgetError, eligible
 from .db import encode, new_id, utc_now
 
 TAIL_MESSAGES = 8
@@ -227,6 +229,35 @@ def memory_job(db: sqlite3.Connection, chat_id: str, summary: dict, target: int)
     return job_id
 
 
+def background_budget_paused(
+    db: sqlite3.Connection, chat_id: str, base_version: int
+) -> bool:
+    denied = db.execute(
+        """SELECT json_extract(error, '$.code') AS code, budget_required_nano, next_dispatch
+           FROM jobs WHERE chat_id=? AND kind='memory' AND base_version=?
+             AND status='failed' AND budget_denial_revision IS NOT NULL
+           ORDER BY created_at DESC, id DESC LIMIT 1""",
+        (chat_id, base_version),
+    ).fetchone()
+    if denied is None:
+        return False
+    if (
+        denied["code"] == "budget_pricing_unavailable"
+        and denied["next_dispatch"] > time.time()
+    ):
+        return True
+    # Old denials had no saved estimate. Reconsider them once against current
+    # headroom and persist the precise requirement on any subsequent denial.
+    required = denied["budget_required_nano"] or 1
+    if config.SUMMARY_MODEL == config.FREE_ROUTER:
+        required = 0
+    try:
+        eligible(db, config.SUMMARY_MODEL, required)
+    except BudgetError:
+        return True
+    return False
+
+
 def schedule_background(db: sqlite3.Connection, chat_id: str, before_seq: int) -> None:
     summary = summary_at(db, chat_id, before_seq)
     target = db.execute(
@@ -237,13 +268,12 @@ def schedule_background(db: sqlite3.Connection, chat_id: str, before_seq: int) -
     if target:
         job = db.execute(
             """SELECT 1 FROM jobs WHERE chat_id=? AND kind='memory' AND base_version=?
-               AND ((target_seq>=? AND status IN ('queued', 'running'))
-                    OR (status='failed' AND budget_denial_revision=(
-                        SELECT openrouter_budget_revision FROM installation WHERE id=1
-                    )))""",
+               AND target_seq>=? AND status IN ('queued', 'running')""",
             (chat_id, summary["version"], target[0]),
         ).fetchone()
-        if job is None:
+        if job is None and not background_budget_paused(
+            db, chat_id, summary["version"]
+        ):
             memory_job(db, chat_id, summary, target[0])
 
 

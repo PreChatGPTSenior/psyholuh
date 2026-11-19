@@ -84,6 +84,32 @@ class Meter:
         self.settled |= amount is not None
 
 
+def preflight_rejection(status: int, packet, model: str) -> bool:
+    if status in (401, 402):
+        return True
+    if status != 404 or not isinstance(packet, dict):
+        return False
+    error = packet.get("error")
+    if not isinstance(error, dict) or error.get("code") != 404:
+        return False
+    metadata = error.get("metadata")
+    if metadata is not None and (
+        not isinstance(metadata, dict)
+        or "provider_name" in metadata
+        or "raw" in metadata
+    ):
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    # Only recognize explicit OpenRouter routing failures. A generic 404 can
+    # originate upstream and is insufficient evidence to release a hold.
+    return message.removesuffix(".") in (
+        f"No endpoints found for {model}",
+        "No endpoints found that support the requested parameters",
+    )
+
+
 @asynccontextmanager
 async def paid_response(
     payload: dict, scope: ChargeScope, category: CATEGORY, timeout: int
@@ -120,16 +146,16 @@ async def paid_response(
                 body = await response.aread()
                 try:
                     packet = json_decimals(body)
-                    if isinstance(packet, dict):
-                        meter.record(packet)
                 except ValueError:
-                    pass
-                # These OpenRouter preflight statuses deny access or credits.
-                # All ambiguous upstream/transport failures retain the hold.
+                    packet = None
+                if isinstance(packet, dict):
+                    meter.record(packet)
                 if (
-                    response.status_code in (401, 402)
-                    and not meter.generation_id
+                    not meter.generation_id
                     and not meter.settled
+                    and preflight_rejection(
+                        response.status_code, packet, payload["model"]
+                    )
                 ):
                     release_unsent(meter.charge_id)
                 response.raise_for_status()
