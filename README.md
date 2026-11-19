@@ -16,11 +16,17 @@ Open **«Встреча в пятницу»** and ask **«На какой ден
 
 ## Start a personal conversation
 
-Copy `.env.example` to `.env`, set `PSYHOLUH_DEMO=0`, and add your `OPENROUTER_API_KEY`. Start Compose again. Create a chat and choose its model. Opening another chat changes the active conversation without changing either chat's model or history.
+Copy `.env.example` to `.env`, set `PSYHOLUH_DEMO=0`, and add your `OPENROUTER_API_KEY`. Start Compose again. Set a USD limit in **Настройки** before your first paid request. Create a chat and choose its model. Opening another chat changes the active conversation without changing either chat's model or history.
 
 The microphone and file picker create an editable transcript. Review it before sending. The speech worker runs `faster-whisper` locally. If its model is missing, the first real transcription can take longer while the model downloads. Successful transcription removes the temporary recording and keeps the text draft.
 
 Personal messages are stored on the computer. When you send a message, OpenRouter receives its text and the context selected for that reply. If memory compression uses a hosted model, it also receives the messages being compressed and the previous summary. Audio is processed locally.
+
+## Budget and conversation costs
+
+The budget is the total USD ceiling for OpenRouter calls recorded by this installation. A zero limit pauses paid calls. Before each reply or compression call, the API or worker reserves a conservative estimate in SQLite. It checks the full prompt, the output token cap and the price of eligible routes. Both processes share the same budget.
+
+The conversation header shows the latest reply's reported charge and the conversation total for replies and compression. Background work refreshes those figures as charges settle. When a request ends without cost metadata, its reservation remains pending while the application can reconcile it by generation ID. Messages from before accounting was added can have an unknown price. Demo conversations and local transcription add no OpenRouter charges.
 
 ## Architecture
 
