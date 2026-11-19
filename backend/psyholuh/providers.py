@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 
 import httpx
 
@@ -22,6 +23,12 @@ class ProviderError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ReplyPart:
+    text: str = ""
+    model_id: str | None = None
+
+
 def headers() -> dict[str, str]:
     if not config.OPENROUTER_API_KEY:
         raise ProviderError("На сервере не настроен ключ OpenRouter.")
@@ -30,7 +37,7 @@ def headers() -> dict[str, str]:
 
 async def openrouter_stream(
     model: str, messages: list[dict[str, str]]
-) -> AsyncIterator[str]:
+) -> AsyncIterator[ReplyPart]:
     payload = {
         "model": model,
         "messages": messages,
@@ -43,6 +50,7 @@ async def openrouter_stream(
     ):
         response.raise_for_status()
         finished = False
+        observed_model = None
         async for line in response.aiter_lines():
             if not line.startswith("data:"):
                 continue
@@ -52,12 +60,20 @@ async def openrouter_stream(
             frame = json.loads(raw)
             if frame.get("error"):
                 raise ProviderError("Модель вернула ошибку во время ответа.")
+            reported_model = frame.get("model")
+            if (
+                isinstance(reported_model, str)
+                and reported_model
+                and observed_model != reported_model
+            ):
+                observed_model = reported_model
+                yield ReplyPart(model_id=reported_model)
             for choice in frame.get("choices", []):
                 if choice.get("finish_reason") in ("error", "content_filter"):
                     raise ProviderError("Провайдер прервал ответ.")
                 fragment = (choice.get("delta") or {}).get("content")
                 if isinstance(fragment, str) and fragment:
-                    yield fragment
+                    yield ReplyPart(text=fragment)
                 finished = bool(choice.get("finish_reason")) or finished
         if not finished:
             raise ProviderError("Поток прервался до окончания ответа.")
@@ -101,11 +117,11 @@ def demo_reply(messages: list[dict[str, str]], mode: str) -> str:
 
 async def reply(
     model: str, messages: list[dict[str, str]], mode: str
-) -> AsyncIterator[str]:
+) -> AsyncIterator[ReplyPart]:
     if config.DEMO:
         for fragment in re.findall(r"\S+\s*|\s+", demo_reply(messages, mode)):
             await asyncio.sleep(0.045)
-            yield fragment
+            yield ReplyPart(text=fragment, model_id=model)
         return
     async for fragment in openrouter_stream(model, messages):
         yield fragment

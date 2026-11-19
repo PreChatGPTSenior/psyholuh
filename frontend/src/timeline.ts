@@ -40,6 +40,7 @@ export function useTimeline(
   api: ChatApi,
   chatId: string,
   scope: string,
+  visible: boolean,
   onAccepted: (submission: Submission) => void,
   onCompleted: () => void,
 ) {
@@ -125,11 +126,11 @@ export function useTimeline(
   }
 
   useEffect(() => {
-    void loadHistory()
-    return () => controller.current?.abort()
-    // A workspace is keyed by its chat and lives as long as the application.
+    if (visible) void loadHistory()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, chatId])
+  }, [api, chatId, visible])
+
+  useEffect(() => () => controller.current?.abort(), [])
 
   const watching = attempt?.phase === 'already_running' || (!attempt && messages.some((message) => message.status === 'streaming'))
   useEffect(() => {

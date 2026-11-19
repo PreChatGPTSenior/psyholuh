@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { errorText, type AudioJob, type ChatApi } from './api'
 
 const audioLimit = 25 * 1024 * 1024
+const recordingLimit = audioLimit - 1024 * 1024
 
 export function useAudio(api: ChatApi, chatId: string, scope: string, visible: boolean, onRecording: (recording: boolean) => void) {
   const draftKey = `psyholuh-transcripts-v1/${scope}/${chatId}`
@@ -13,6 +14,8 @@ export function useAudio(api: ChatApi, chatId: string, scope: string, visible: b
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [recording, setRecording] = useState(false)
+  const [pendingRecording, setPendingRecording] = useState<File | null>(null)
+  const [recordingUrl, setRecordingUrl] = useState('')
   const recorder = useRef<MediaRecorder | null>(null)
   const media = useRef<MediaStream | null>(null)
   const version = useRef(0)
@@ -65,6 +68,7 @@ export function useAudio(api: ChatApi, chatId: string, scope: string, visible: b
       if (file.size > audioLimit) throw new Error('Файл больше 25 МиБ.')
       const job = await api.upload(chatId, file)
       setJobs((current) => [job, ...current.filter((item) => item.job_id !== job.job_id)])
+      setPendingRecording((current) => current === file ? null : current)
     })
     onRecording(false)
   }
@@ -85,7 +89,7 @@ export function useAudio(api: ChatApi, chatId: string, scope: string, visible: b
   }
 
   async function start() {
-    if (recorder.current || mutating.current) return
+    if (recorder.current || mutating.current || pendingRecording) return
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       setError('Микрофон недоступен. Можно загрузить готовую запись.')
       return
@@ -96,13 +100,13 @@ export function useAudio(api: ChatApi, chatId: string, scope: string, visible: b
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
         media.current = stream
         const codec = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus'].find((type) => MediaRecorder.isTypeSupported(type))
-        const input = codec ? new MediaRecorder(stream, { mimeType: codec }) : new MediaRecorder(stream)
+        const input = new MediaRecorder(stream, { mimeType: codec, audioBitsPerSecond: 64_000 })
         const parts: Blob[] = []
         let bytes = 0
         input.ondataavailable = (event) => {
           parts.push(event.data)
           bytes += event.data.size
-          if (bytes > audioLimit && input.state !== 'inactive') input.stop()
+          if (bytes >= recordingLimit && input.state !== 'inactive') input.stop()
         }
         input.onstop = () => {
           stream.getTracks().forEach((track) => track.stop())
@@ -111,7 +115,9 @@ export function useAudio(api: ChatApi, chatId: string, scope: string, visible: b
           setRecording(false)
           const type = input.mimeType || parts[0]?.type || 'audio/webm'
           const extension = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm'
-          void upload(new File(parts, `recording.${extension}`, { type: type.split(';')[0] }))
+          const file = new File(parts, `recording.${extension}`, { type: type.split(';')[0] })
+          if (file.size) setPendingRecording(file)
+          void upload(file)
         }
         input.onerror = () => {
           input.onstop = null
@@ -156,7 +162,23 @@ export function useAudio(api: ChatApi, chatId: string, scope: string, visible: b
     media.current?.getTracks().forEach((track) => track.stop())
   }, [])
 
-  return { jobs, edits, error, busy, recording, upload, discard, retry, edit, start, consumed,
+  useEffect(() => {
+    if (!pendingRecording) {
+      setRecordingUrl('')
+      return
+    }
+    const url = URL.createObjectURL(pendingRecording)
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    setRecordingUrl(url)
+    window.addEventListener('beforeunload', warn)
+    return () => {
+      URL.revokeObjectURL(url)
+      window.removeEventListener('beforeunload', warn)
+    }
+  }, [pendingRecording])
+
+  return { jobs, edits, error, busy, recording, pendingRecording, recordingUrl, upload, discard, retry, edit, start, consumed,
+    discardRecording: () => { setPendingRecording(null); setError('') },
     stop: () => {
       const input = recorder.current
       if (input && input.state !== 'inactive') input.stop()

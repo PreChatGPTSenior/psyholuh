@@ -180,13 +180,14 @@ def append_fragment(attempt: Attempt, text: str) -> None:
             raise LeaseLost()
 
 
-def complete_reply(attempt: Attempt, evidence: dict) -> dict:
+def complete_reply(attempt: Attempt, evidence: dict, actual_model: str) -> dict:
     with write() as db:
         changed = db.execute(
-            """UPDATE messages SET status='complete', completed_at=?, evidence=?, attempt_id=NULL, lease_until=NULL
+            """UPDATE messages SET status='complete', completed_at=?, model_id=?, evidence=?, attempt_id=NULL, lease_until=NULL
                WHERE id=? AND status='streaming' AND attempt_id=? AND lease_until>?""",
             (
                 utc_now(),
+                actual_model,
                 encode(evidence),
                 attempt.assistant["id"],
                 attempt.key,
@@ -365,15 +366,18 @@ async def produce(attempt: Attempt, output: asyncio.Queue) -> None:
         window = await prepare(attempt, text)
         await status("generating")
         has_output = False
-        async for fragment in reply(
-            attempt.assistant["model_id"], window.messages, attempt.user["mode"]
-        ):
-            append_fragment(attempt, fragment)
-            has_output = True
-            await output.put(sse("delta", {"text": fragment}))
+        selected_model = attempt.assistant["model_id"]
+        actual_model = selected_model
+        async for part in reply(selected_model, window.messages, attempt.user["mode"]):
+            if part.model_id:
+                actual_model = part.model_id
+            if part.text:
+                append_fragment(attempt, part.text)
+                has_output = True
+                await output.put(sse("delta", {"text": part.text}))
         if not has_output:
             raise ProviderError("Модель не вернула текст ответа.")
-        attempt.assistant = complete_reply(attempt, window.evidence)
+        attempt.assistant = complete_reply(attempt, window.evidence, actual_model)
         completed = True
         await output.put(done(attempt))
     except APIError as exc:

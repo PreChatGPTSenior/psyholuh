@@ -69,7 +69,7 @@ export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope,
   const preservePosition = useRef<{ height: number; top: number } | null>(null)
 
   const audio = useAudio(api, chat.id, scope, visible, onRecording)
-  const timeline = useTimeline(api, chat.id, scope, (submission) => {
+  const timeline = useTimeline(api, chat.id, scope, visible, (submission) => {
     if (submission.audio_id) audio.consumed(submission.audio_id)
     onAccepted(submission)
   }, () => setRevision((count) => count + 1))
@@ -77,10 +77,14 @@ export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope,
   const busy = !!current && current.phase !== 'failed'
   const unresolved = !!current || timeline.messages.some((message) => message.status === 'streaming')
   const canSubmit = timeline.ready && !unresolved && !moving && !audio.recording
-  const canRecord = !moving && !audio.busy
+  const canRecord = !moving && !audio.busy && !audio.pendingRecording
   const canRetryHistory = !unresolved && !moving && !resolving
   const requestUser = timeline.messages.find((message) => message.role === 'user' && current && message.request_id === current.submission.request_id)
   const requestReply = timeline.messages.find((message) => message.role === 'assistant' && current && message.request_id === current.submission.request_id)
+
+  useEffect(() => {
+    if (visible) setMode(chat.mode)
+  }, [chat.mode, visible])
 
   useLayoutEffect(() => {
     const element = scroll.current
@@ -243,8 +247,20 @@ export function Workspace({ api, chat, visible, moving, modelLabel, demo, scope,
         </div>
         <div className="composer-region">
           <div className="composer-width">
-            {(audio.error || audio.jobs.length > 0) && <div className="audio-jobs">
-              {audio.error && <Notice action={audio.refresh}>{audio.error}</Notice>}
+            {(audio.error || audio.pendingRecording || audio.jobs.length > 0) && <div className="audio-jobs">
+              {audio.error && <Notice action={audio.pendingRecording ? undefined : audio.refresh}>{audio.error}</Notice>}
+              {audio.pendingRecording && <section className="audio-card" aria-label="Запись перед загрузкой">
+                <div className="audio-details">
+                  <strong>Запись в браузере</strong>
+                  <div className="draft-actions">
+                    {audio.recordingUrl && <a className="text-button" href={audio.recordingUrl} download={audio.pendingRecording.name}>Скачать запись</a>}
+                    <button type="button" className="text-button" disabled={audio.busy} onClick={audio.discardRecording}>Удалить</button>
+                    {!audio.busy && <button type="button" className="secondary-button" onClick={() => {
+                      if (audio.pendingRecording) void audio.upload(audio.pendingRecording)
+                    }}>Повторить загрузку</button>}
+                  </div>
+                </div>
+              </section>}
               {audio.jobs.map(audioCard)}
             </div>}
             <form className="composer" onSubmit={(event) => { event.preventDefault(); submit(text) }}>
