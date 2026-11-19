@@ -22,6 +22,7 @@ from .providers import compress
 LOGGER = logging.getLogger(__name__)
 JOB_TIMEOUTS = {"audio": 900, "memory": 300}
 JOB_LEASE = 35
+PRICING_RETRY_COOLDOWN = 30
 TRANSCRIPTION_ERROR = {
     "code": "transcription_failed",
     "message": "Не удалось расшифровать аудио. Попробуйте снова.",
@@ -288,10 +289,20 @@ def run_job(job_id: str, delivery_id: str) -> None:
     except BudgetError as exc:
         with write() as db:
             if still_owns(db, job):
+                pricing_unavailable = exc.detail["code"] == "budget_pricing_unavailable"
                 db.execute(
                     """UPDATE jobs SET status='failed', attempt_id=NULL, lease_until=NULL,
-                           error=?, budget_denial_revision=? WHERE id=?""",
-                    (encode(exc.detail), exc.revision, job["id"]),
+                           error=?, budget_denial_revision=?, budget_required_nano=?, next_dispatch=?
+                       WHERE id=?""",
+                    (
+                        encode(exc.detail),
+                        exc.revision,
+                        exc.required_nano,
+                        time.time() + PRICING_RETRY_COOLDOWN
+                        if pricing_unavailable
+                        else 0,
+                        job["id"],
+                    ),
                 )
     except Exception as exc:  # noqa: BLE001 - third-party failures must update the durable job
         # Keep provider output, conversation text and filesystem details out of logs.

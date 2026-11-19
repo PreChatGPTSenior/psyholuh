@@ -17,7 +17,7 @@ CATEGORY = Literal["reply", "compression"]
 
 
 class BudgetError(APIError):
-    def __init__(self, code: str, revision: int):
+    def __init__(self, code: str, revision: int, required_nano: int | None = None):
         message = {
             "budget_required": "Укажите общий бюджет OpenRouter в настройках.",
             "budget_exceeded": "Для этого запроса недостаточно доступного бюджета OpenRouter.",
@@ -27,6 +27,7 @@ class BudgetError(APIError):
             503 if code == "budget_pricing_unavailable" else 409, code, message, True
         )
         self.revision = revision
+        self.required_nano = required_nano
 
 
 @dataclass(frozen=True)
@@ -189,7 +190,7 @@ def eligible(db: sqlite3.Connection, model: str, amount: int = 0) -> int:
         return revision
     replies, compression, pending = totals(db)
     if not limit or replies + compression + pending + amount > limit:
-        raise BudgetError("budget_exceeded", revision)
+        raise BudgetError("budget_exceeded", revision, max(1, amount))
     return revision
 
 
