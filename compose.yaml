@@ -1,0 +1,87 @@
+x-backend-environment: &backend-environment
+  PSYHOLUH_DEMO: ${PSYHOLUH_DEMO:-1}
+  PSYHOLUH_DATA_DIR: /data
+  PSYHOLUH_REDIS_URL: redis://redis:6379/0
+  PSYHOLUH_CLAUDE_MODEL: ${PSYHOLUH_CLAUDE_MODEL:-anthropic/claude-sonnet-4.5}
+  PSYHOLUH_DEEPSEEK_MODEL: ${PSYHOLUH_DEEPSEEK_MODEL:-deepseek/deepseek-v3.2}
+  PSYHOLUH_SUMMARY_MODEL: ${PSYHOLUH_SUMMARY_MODEL:-}
+  PSYHOLUH_CLAUDE_CONTEXT: ${PSYHOLUH_CLAUDE_CONTEXT:-24000}
+  PSYHOLUH_DEEPSEEK_CONTEXT: ${PSYHOLUH_DEEPSEEK_CONTEXT:-24000}
+  PSYHOLUH_SUMMARY_CONTEXT: ${PSYHOLUH_SUMMARY_CONTEXT:-16000}
+x-backend-service: &backend-service
+  build:
+    context: ./backend
+    target: api
+  volumes:
+    - psyholuh-data:/data
+
+services:
+  web:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+  backend:
+    <<: *backend-service
+    environment:
+      <<: *backend-environment
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health', timeout=2).close()"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - psyholuh-redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  audio-worker:
+    <<: *backend-service
+    build:
+      context: ./backend
+      target: audio
+    command: ["python", "-m", "psyholuh.jobs", "audio"]
+    environment:
+      <<: *backend-environment
+      PSYHOLUH_WHISPER_MODEL: ${PSYHOLUH_WHISPER_MODEL:-small}
+      PSYHOLUH_WHISPER_DEVICE: ${PSYHOLUH_WHISPER_DEVICE:-cpu}
+      PSYHOLUH_WHISPER_COMPUTE_TYPE: ${PSYHOLUH_WHISPER_COMPUTE_TYPE:-int8}
+      PSYHOLUH_WHISPER_LANGUAGE: ${PSYHOLUH_WHISPER_LANGUAGE-ru}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  memory-worker:
+    <<: *backend-service
+    command: ["python", "-m", "psyholuh.jobs", "memory"]
+    environment:
+      <<: *backend-environment
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  reconciler:
+    <<: *backend-service
+    command: ["python", "-m", "psyholuh.jobs", "reconcile"]
+    environment: *backend-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  psyholuh-data:
+  psyholuh-redis:
