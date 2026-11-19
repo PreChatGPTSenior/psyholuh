@@ -8,6 +8,7 @@ AUDIO_DIR = DATA_DIR / ("demo-audio" if DEMO else "personal-audio")
 REDIS_URL = os.getenv("PSYHOLUH_REDIS_URL", "redis://localhost:6379/0")
 REDIS_NAMESPACE = f"psyholuh-{'demo' if DEMO else 'personal'}"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+FREE_ROUTER = "openrouter/free"
 CLAUDE_MODEL = (
     "demo/claude"
     if DEMO

@@ -14,6 +14,7 @@ from rq.exceptions import NoSuchJobError
 from rq.job import Job
 
 from . import config
+from .budget import BudgetError, ChargeScope
 from .db import APIError, encode, initialize, new_id, read, utc_now, write
 from .memory import history_rows, summary_at
 from .providers import compress
@@ -222,7 +223,8 @@ async def compute_summary(job: sqlite3.Row, previous: dict) -> str:
                 db, job["chat_id"], job["base_seq"], job["target_seq"]
             )
         )
-        return await compress(previous["text"], records)
+        scope = ChargeScope(job["chat_id"], job["attempt_id"], job_id=job["id"])
+        return await compress(previous["text"], records, scope)
 
 
 def summarize_history(job: sqlite3.Row) -> None:
@@ -283,6 +285,14 @@ def run_job(job_id: str, delivery_id: str) -> None:
             transcribe(job)
         else:
             summarize_history(job)
+    except BudgetError as exc:
+        with write() as db:
+            if still_owns(db, job):
+                db.execute(
+                    """UPDATE jobs SET status='failed', attempt_id=NULL, lease_until=NULL,
+                           error=?, budget_denial_revision=? WHERE id=?""",
+                    (encode(exc.detail), exc.revision, job["id"]),
+                )
     except Exception as exc:  # noqa: BLE001 - third-party failures must update the durable job
         # Keep provider output, conversation text and filesystem details out of logs.
         LOGGER.warning("Job %s failed (%s)", job["id"], type(exc).__name__)
