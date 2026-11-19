@@ -45,6 +45,21 @@ export interface MessagePage {
   next_before_seq: number | null
 }
 
+export interface Budget {
+  limit_usd: string | null
+  spent_usd: string
+  reserved_usd: string
+  available_usd: string | null
+}
+
+export interface ChatCosts {
+  total_usd: string
+  replies_usd: string
+  compression_usd: string
+  reserved_usd: string
+  last_reply: { message_id: string; cost_usd: string | null; pending: boolean } | null
+}
+
 export interface ApiErrorData {
   code: string
   message: string
@@ -101,6 +116,9 @@ export type StreamEvent =
 
 export interface ChatApi {
   health(): Promise<{ status: 'ok'; demo: boolean }>
+  budget(): Promise<Budget>
+  setBudget(limitUsd: string): Promise<Budget>
+  costs(chatId: string): Promise<ChatCosts>
   models(): Promise<{ models: Model[] }>
   chats(): Promise<ChatList>
   create(modelId: string, title?: string): Promise<Chat>
@@ -201,6 +219,9 @@ export async function readSse(body: ReadableStream<Uint8Array>, onEvent: (event:
 
 const realApi: ChatApi = {
   health: () => json('/health'),
+  budget: () => json('/settings/budget'),
+  setBudget: (limit_usd) => json('/settings/budget', { ...post({ limit_usd }), method: 'PUT' }),
+  costs: (id) => json(`${chatPath(id)}/costs`),
   models: () => json('/models'),
   chats: () => json('/chats'),
   create: (model_id, title) => json('/chats', post({ model_id, title })),

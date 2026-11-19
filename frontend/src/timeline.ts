@@ -6,8 +6,11 @@ type Attempt = {
   text: string
   phase: StreamPhase | 'connecting' | 'failed'
   error?: string
+  errorCode?: string
   retryable?: boolean
 }
+
+type Failure = { message: string; retryable: boolean; code?: string }
 
 const storageKey = (scope: string, chatId: string) => `psyholuh-outbox-v1/${scope}/${chatId}`
 function readOutbox(key: string): Submission | null {
@@ -68,7 +71,7 @@ export function useTimeline(
     return page.messages
   }
 
-  function reconcile(items: Message[], submission: Submission, error?: string, retryable = true) {
+  function reconcile(items: Message[], submission: Submission, failure?: Failure) {
     const reply = items.find((message) => message.request_id === submission.request_id && message.role === 'assistant')
     if (reply?.status === 'complete') {
       pending.current = null
@@ -82,8 +85,8 @@ export function useTimeline(
     } else {
       setAttempt({
         submission, text: reply?.text ?? '',
-        phase: 'failed', error: error || (reply ? 'Ответ прервался. Можно продолжить.' : 'Отправка не подтверждена. Можно повторить.'),
-        retryable,
+        phase: 'failed', error: failure?.message || (reply ? 'Ответ прервался. Можно продолжить.' : 'Отправка не подтверждена. Можно повторить.'),
+        retryable: failure?.retryable ?? true, errorCode: failure?.code,
       })
       if (reply) onAccepted(submission)
     }
@@ -154,7 +157,7 @@ export function useTimeline(
     setAttempt({ submission, text: '', phase: 'connecting' })
     let accepted = false
     let finished = false
-    let failure: { message: string; retryable: boolean } | undefined
+    let failure: Failure | undefined
     const markAccepted = () => {
       if (!accepted) {
         accepted = true
@@ -196,14 +199,15 @@ export function useTimeline(
       failure = {
         message: signal.signal.aborted ? 'Получение ответа остановлено.' : errorText(error),
         retryable: !(error instanceof ApiError) || error.data.retryable || error.status >= 500,
+        code: error instanceof ApiError ? error.data.code : undefined,
       }
     } finally {
       if (failure) {
-        const { message, retryable } = failure
+        const { message, retryable, code } = failure
         try {
-          reconcile(await refresh(), submission, message, retryable)
+          reconcile(await refresh(), submission, failure)
         } catch {
-          setAttempt((current) => current && { ...current, phase: 'failed', error: message, retryable })
+          setAttempt((current) => current && { ...current, phase: 'failed', error: message, retryable, errorCode: code })
         }
       }
       if (controller.current === signal) controller.current = null

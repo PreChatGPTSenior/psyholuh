@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowRight, LockKeyhole, Menu, MessageCircle, Plus, X } from 'lucide-react'
 import { errorText, getApi, type Chat, type ChatApi, type ChatList, type Model, type Submission } from './api'
 import { Workspace } from './Workspace'
 import { Brand, Dialog, EmptyState, Notice } from './components'
+import { BudgetButton, BudgetDialog, BudgetPrompt } from './Budget'
+import { useFinanceRead } from './finance'
 
 type Connected = { api: ChatApi; models: Model[]; demo: boolean }
 
@@ -15,12 +17,18 @@ export function App() {
   const [audioCapture, setAudioCapture] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [creating, setCreating] = useState(false)
+  const [budgetOpen, setBudgetOpen] = useState(false)
   const [modelChoice, setModelChoice] = useState('')
   const [title, setTitle] = useState('')
   const [error, setError] = useState('')
   const [dialogError, setDialogError] = useState('')
   const operation = useRef(false)
   const closeNavigation = useRef<HTMLButtonElement>(null)
+
+  const api = connected?.api
+  const loadBudget = useCallback(() => api!.budget(), [api])
+  const budget = useFinanceRead(loadBudget, !!api, budgetOpen ? 8000 : undefined)
+  const openBudget = () => setBudgetOpen(true)
 
   async function connect() {
     setLoading(true)
@@ -134,8 +142,12 @@ export function App() {
         <header className="topbar">
           <button type="button" className="icon-button menu-toggle" onClick={() => setMobileNav(true)} aria-label="Открыть список бесед"><Menu size={22} /></button>
           <span className="empty-topbar-title">psyholuh</span>
-          {connected?.demo && <span className="demo-tag" title="Вымышленные данные">ДЕМО</span>}
+          <div className="topbar-actions">
+            {connected?.demo && <span className="demo-tag" title="Вымышленные данные">ДЕМО</span>}
+            {connected && <BudgetButton open={openBudget} />}
+          </div>
         </header>
+        {connected && !connected.demo && <BudgetPrompt budget={budget.value} open={openBudget} />}
         <div className="standalone-empty">
           <EmptyState title={loading ? 'Загружаем беседы…' : 'Есть о чём поговорить?'}
             text={loading ? 'Подключаемся к локальному серверу.' : 'Начните беседу, когда будете готовы.'}
@@ -146,11 +158,14 @@ export function App() {
       {connected && opened.map((id) => {
         const chat = state.chats.find((item) => item.id === id)
         return chat && <Workspace key={id} api={connected.api} chat={chat} visible={id === active?.id} moving={moving}
-          modelLabel={modelName(chat.model_id)} demo={connected.demo} scope={scope}
+          modelLabel={modelName(chat.model_id)} demo={connected.demo} scope={scope} budget={budget.value} onBudget={openBudget}
           onMenu={() => setMobileNav(true)} onRecording={setAudioCapture}
           onAccepted={(submission) => accepted(id, submission)} />
       })}
     </main>
+    {budgetOpen && connected && <BudgetDialog budget={budget.value} error={budget.error} onRefresh={() => budget.refresh(true)}
+      save={async (limit) => budget.replace(await connected.api.setBudget(limit))}
+      close={() => setBudgetOpen(false)} />}
     {creating && connected && <Dialog title="Новая беседа" close={() => { if (!moving) setCreating(false) }}>
       <form onSubmit={(event) => {
         event.preventDefault()

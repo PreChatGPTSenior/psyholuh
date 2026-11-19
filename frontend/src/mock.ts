@@ -1,4 +1,4 @@
-import { ApiError, readSse, type AudioJob, type Chat, type ChatApi, type MemoryNote, type Message, type Source, type StreamEvent, type Submission } from './api'
+import { ApiError, readSse, type AudioJob, type Budget, type Chat, type ChatApi, type MemoryNote, type Message, type Source, type StreamEvent, type Submission } from './api'
 
 const firstChat = 'demo-meeting'
 const models = [
@@ -7,9 +7,19 @@ const models = [
 ]
 const now = () => new Date().toISOString()
 const fail = (status: number, code: string, message: string, retryable = false) => new ApiError(status, { code, message, retryable })
-const key = 'psyholuh-mock-v1'
+const personal = import.meta.env.VITE_MOCK_PERSONAL_MODE === '1'
+const key = personal ? 'psyholuh-mock-personal-v1' : 'psyholuh-mock-v1'
 type MockJob = AudioJob & { ready: number; shouldFail: boolean; attempts: number }
-type Store = { active: string; chats: Chat[]; messages: Message[]; jobs: MockJob[]; submissions: Record<string, Submission> }
+type MockCharge = { chatId: string; pendingUntil: number }
+type Store = {
+  active: string | null
+  chats: Chat[]
+  messages: Message[]
+  jobs: MockJob[]
+  submissions: Record<string, Submission>
+  budgetLimit?: string
+  charges?: Record<string, MockCharge>
+}
 const date = '2026-11-18T15:00:00Z'
 function firstMessage(seq: number, role: Message['role'], text: string): Message {
   return { id: `demo-message-${seq}`, chat_id: firstChat, seq, role, text, status: 'complete', created_at: date,
@@ -27,9 +37,10 @@ const initial: Store = {
   jobs: [],
   submissions: {},
 }
+const initialStore = (): Store => personal ? { active: null, chats: [], messages: [], jobs: [], submissions: {} } : structuredClone(initial)
 let store: Store
-try { store = JSON.parse(localStorage.getItem(key) ?? 'null') ?? structuredClone(initial) }
-catch { store = structuredClone(initial) }
+try { store = JSON.parse(localStorage.getItem(key) ?? 'null') ?? initialStore() }
+catch { store = initialStore() }
 
 function save() {
   try { localStorage.setItem(key, JSON.stringify(store)) } catch { /* in-memory fallback */ }
@@ -69,6 +80,37 @@ function updateJob(job: MockJob) {
 }
 
 const running = new Set<string>()
+const reservations = new Map<string, string>()
+const scale = 1000000000n
+const replyCharge = personal ? 1125000n : 0n
+const compressionCharge = personal ? 375000n : 0n
+const hold = personal ? 2000000n : 0n
+
+function nanoUsd(value: string) {
+  const [whole, fraction = ''] = value.split('.')
+  return BigInt(whole) * scale + BigInt(fraction.padEnd(9, '0'))
+}
+
+function usd(value: bigint) {
+  const fraction = (value % scale).toString().padStart(9, '0').replace(/0+$/, '')
+  return `${value / scale}${fraction ? `.${fraction}` : ''}`
+}
+
+function totals(chatId?: string) {
+  const charges = Object.values(store.charges ?? {}).filter((charge) => !chatId || charge.chatId === chatId)
+  const waiting = charges.filter((charge) => charge.pendingUntil > Date.now()).length
+  const settled = BigInt(charges.length - waiting)
+  const running = Array.from(reservations.values()).filter((id) => !chatId || id === chatId).length
+  return { replies: settled * replyCharge, compression: settled * compressionCharge, reserved: BigInt(running + waiting) * hold }
+}
+
+function budget(): Budget {
+  const { replies, compression, reserved } = totals()
+  const spent = replies + compression
+  const limit = store.budgetLimit ?? null
+  const available = limit === null ? null : nanoUsd(limit) - spent - reserved
+  return { limit_usd: limit, spent_usd: usd(spent), reserved_usd: usd(reserved), available_usd: available === null ? null : usd(available > 0n ? available : 0n) }
+}
 for (const message of store.messages) {
   if (message.status === 'streaming') message.status = 'interrupted'
 }
@@ -96,7 +138,25 @@ async function emitDemo(events: StreamEvent[], callback: (event: StreamEvent) =>
 }
 
 export const mockApi: ChatApi = {
-  async health() { return { status: 'ok', demo: true } },
+  async health() { return { status: 'ok', demo: !personal } },
+  async budget() { return budget() },
+  async setBudget(limit) {
+    if (!/^[0-9]+(?:\.[0-9]{1,9})?$/.test(limit)) throw fail(422, 'invalid_budget', 'Проверьте формат бюджета.')
+    store.budgetLimit = usd(nanoUsd(limit))
+    save()
+    return budget()
+  },
+  async costs(id) {
+    lookupChat(id)
+    const { replies, compression, reserved } = totals(id)
+    const answer = store.messages.findLast((item) => item.chat_id === id && item.role === 'assistant' && item.status === 'complete')
+    const charge = answer && store.charges?.[answer.id]
+    const pending = !!charge && charge.pendingUntil > Date.now()
+    return {
+      total_usd: usd(replies + compression), replies_usd: usd(replies), compression_usd: usd(compression), reserved_usd: usd(reserved),
+      last_reply: answer ? { message_id: answer.id, cost_usd: charge && !pending ? usd(replyCharge) : null, pending } : null,
+    }
+  },
   async models() { return { models } },
   async chats() {
     return { active_chat_id: store.active, chats: [...store.chats].sort((a, b) => b.updated_at.localeCompare(a.updated_at)) }
@@ -169,19 +229,36 @@ export const mockApi: ChatApi = {
         : 'Я рядом. Если хочется, можно рассказать об этом подробнее в своём темпе.'
     const events: StreamEvent[] = [
       { event: 'status', data: { phase: text.length > 2000 ? 'processing_long_message' : 'preparing_context', request_id } },
-      { event: 'status', data: { phase: 'generating', request_id } },
-      ...(reply.match(/.{1,8}/gu) ?? []).map((text): StreamEvent => ({ event: 'delta', data: { text } })),
-      { event: 'done', data: { user: { ...user }, assistant: { ...assistant, text: reply, status: 'complete' } } },
     ]
+    const available = budget().available_usd
+    if (personal && (available === null || nanoUsd(available) < hold)) {
+      events.push({ event: 'error', data: {
+        code: available === null ? 'budget_required' : 'budget_exceeded',
+        message: available === null ? 'Установите бюджет.' : 'Для запроса не хватает бюджета.',
+        retryable: true,
+      } })
+    } else {
+      reservations.set(requestKey, id)
+      events.push({ event: 'status', data: { phase: 'generating', request_id } },
+      ...(reply.match(/.{1,8}/gu) ?? []).map((text): StreamEvent => ({ event: 'delta', data: { text } })),
+      { event: 'done', data: { user: { ...user }, assistant: { ...assistant, text: reply, status: 'complete' } } })
+    }
     try {
       await emitDemo(events, (event) => {
         if (event.event === 'delta') assistant.text += event.data.text
-        if (event.event === 'done') assistant.status = 'complete'
+        if (event.event === 'done') {
+          assistant.status = 'complete'
+          store.charges ??= {}
+          store.charges[assistant.id] = { chatId: id, pendingUntil: personal ? Date.now() + 1800 : 0 }
+          reservations.delete(requestKey)
+        }
+        if (event.event === 'error') assistant.status = 'interrupted'
         save()
         callback(event)
       }, signal)
     } finally {
       running.delete(requestKey)
+      reservations.delete(requestKey)
       if (assistant.status === 'streaming') assistant.status = 'interrupted'
       save()
     }
