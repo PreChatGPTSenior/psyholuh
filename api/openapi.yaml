@@ -1,0 +1,355 @@
+openapi: 3.1.0
+info:
+  title: psyholuh local API
+  version: 0.1.0
+  description: |
+    Single-user API served on the same origin as the web UI under /api.
+    IDs are opaque strings, timestamps use UTC, and JSON keys use snake_case.
+    A chat owns its model and all of its messages, drafts and memory. At most
+    one chat is active. Creating or activating a chat updates that selection.
+    An in-flight operation continues to belong to its original chat.
+servers:
+  - url: /api
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      responses:
+        '200':
+          description: API is available and identifies its data mode.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, demo]
+                properties:
+                  status: {const: ok}
+                  demo: {type: boolean}
+  /models:
+    get:
+      operationId: listModels
+      responses:
+        '200':
+          description: Configured models available when creating a chat.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models]
+                properties:
+                  models: {type: array, items: {$ref: '#/components/schemas/Model'}}
+  /chats:
+    get:
+      operationId: listChats
+      responses:
+        '200':
+          description: Chats ordered by most recently updated first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active_chat_id, chats]
+                properties:
+                  active_chat_id: {type: [string, 'null']}
+                  chats: {type: array, items: {$ref: '#/components/schemas/Chat'}}
+    post:
+      operationId: createChat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id]
+              properties:
+                model_id: {type: string, minLength: 1}
+                title: {type: string, minLength: 1, maxLength: 120, default: 'Новая беседа'}
+      responses:
+        '201': {$ref: '#/components/responses/Chat'}
+        default: {$ref: '#/components/responses/Error'}
+  /chats/{chat_id}/activate:
+    parameters:
+      - $ref: '#/components/parameters/ChatId'
+    post:
+      operationId: activateChat
+      responses:
+        '200': {$ref: '#/components/responses/Chat'}
+        default: {$ref: '#/components/responses/Error'}
+  /chats/{chat_id}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ChatId'
+    get:
+      operationId: listMessages
+      parameters:
+        - name: before_seq
+          in: query
+          description: Exclusive upper bound. Omit to fetch the most recent page.
+          schema: {type: integer, minimum: 1}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+      responses:
+        '200':
+          description: Page in ascending seq order. Use next_before_seq to load earlier messages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages, next_before_seq]
+                properties:
+                  messages: {type: array, items: {$ref: '#/components/schemas/Message'}}
+                  next_before_seq: {type: [integer, 'null']}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      operationId: streamReply
+      description: |
+        Use fetch with an SSE parser. The client generates one request_id per
+        user submission and reuses it with the original text, mode and optional
+        audio_id. First acceptance persists the user message, saves the selected
+        mode, reserves an assistant row and consumes any completed same-chat
+        audio draft in one transaction. A valid replay needs no remaining draft.
+        One generation can be active per chat. New or interrupted submissions
+        require the active chat and return 409 while another generation is active.
+        Reuse of the ID with different inputs returns 409 before streaming.
+        Retrying a running request yields status already_running and closes;
+        refresh history to observe its outcome. Retrying a completed request
+        returns done with the saved messages before checking whether any other
+        request is active and without a new provider call. An interrupted retry
+        atomically claims a fresh attempt in the same assistant row and starts
+        its text empty. Clients replace partial output when retrying. Generations
+        use a 120-second lease, renewed while working or waiting on the provider.
+        History reads and submission attempts reconcile expired leases as
+        interrupted. Writes are fenced by the current attempt identifier.
+        A disconnect before done may require a retry to reconcile the response.
+        After the stream starts, failures use an error event; JSON errors apply
+        before the stream starts. New submissions require the active chat.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Submission'}
+            example: {text: 'На какой день перенесли встречу?', mode: analyze, request_id: 'efbd4d78-1b6c-4f6c-8b38-ab685aa00124'}
+      responses:
+        '200':
+          description: |
+            Each SSE event has a named event and a JSON data object.
+            status: {phase, request_id}, phase is preparing_context,
+              processing_long_message, generating or already_running.
+            delta: {text}, an incremental fragment of the assistant text.
+            done: {user, assistant}, both in Message format. Terminal on success.
+            error: {code, message, retryable}. Terminal after a stream failure.
+            Status already_running is terminal for this connection.
+          content:
+            text/event-stream:
+              schema: {type: string}
+              example: |
+                event: status
+                data: {"phase":"generating","request_id":"submission-1"}
+
+                event: delta
+                data: {"text":"На пятницу."}
+
+                event: done
+                data: {"user":{"id":"msg-1","chat_id":"chat-1","seq":1,"role":"user","text":"Когда встреча?","status":"complete","created_at":"2026-11-19T14:00:00Z","request_id":"submission-1","mode":"analyze","model_id":null},"assistant":{"id":"msg-2","chat_id":"chat-1","seq":2,"role":"assistant","text":"На пятницу.","status":"complete","created_at":"2026-11-19T14:00:01Z","request_id":"submission-1","mode":"analyze","model_id":"demo/claude"}}
+
+        default: {$ref: '#/components/responses/Error'}
+  /chats/{chat_id}/audio:
+    parameters:
+      - $ref: '#/components/parameters/ChatId'
+    get:
+      operationId: listAudioDrafts
+      responses:
+        '200':
+          description: Current audio jobs and drafts in most recent first order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs: {type: array, items: {$ref: '#/components/schemas/AudioJob'}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      operationId: uploadAudio
+      description: |
+        Upload a recording to the active chat. Accept WAV, MP3, M4A/MP4, Ogg
+        or WebM up to 25 MiB. On successful transcription, delete the audio file
+        and keep the transcript as a draft until its text is explicitly sent with
+        audio_id. Retain the file when retryable transcription fails.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '202': {$ref: '#/components/responses/AudioJob'}
+        default: {$ref: '#/components/responses/Error'}
+  /chats/{chat_id}/audio/{audio_id}:
+    parameters:
+      - $ref: '#/components/parameters/ChatId'
+      - name: audio_id
+        in: path
+        required: true
+        schema: {type: string}
+    delete:
+      operationId: deleteAudioDraft
+      responses:
+        '204': {description: Draft discarded. A later job result cannot restore it.}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      operationId: getAudioJob
+      responses:
+        '200': {$ref: '#/components/responses/AudioJob'}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs/{job_id}/retry:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      operationId: retryAudioJob
+      description: Retry a failed job with retryable set to true. Other states return 409.
+      responses:
+        '202': {$ref: '#/components/responses/AudioJob'}
+        default: {$ref: '#/components/responses/Error'}
+  /chats/{chat_id}/memory:
+    parameters:
+      - $ref: '#/components/parameters/ChatId'
+    get:
+      operationId: getMemory
+      responses:
+        '200':
+          description: Current memory and evidence actually supplied for the last successful answer.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Memory'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  parameters:
+    ChatId: {in: path, name: chat_id, required: true, schema: {type: string}}
+    JobId: {in: path, name: job_id, required: true, schema: {type: string}}
+  responses:
+    Chat:
+      description: Active chat with the model it was created with.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Chat'}
+    AudioJob:
+      description: Durable audio job and draft state.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/AudioJob'}
+    Error:
+      description: API error. Typical statuses are 404, 409, 413, 415, 422 and 503.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    Model:
+      type: object
+      required: [id, label]
+      properties:
+        id: {type: string}
+        label: {type: string}
+    Chat:
+      type: object
+      required: [id, model_id, title, mode, created_at, updated_at]
+      properties:
+        id: {type: string}
+        model_id: {type: string}
+        title: {type: string}
+        mode:
+          $ref: '#/components/schemas/Mode'
+          description: Mode of the last accepted message. Unsent changes are local to the UI.
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Mode: {type: string, enum: [listen, analyze], default: listen}
+    Submission:
+      type: object
+      required: [text, request_id]
+      properties:
+        text: {type: string, minLength: 1}
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        mode: {$ref: '#/components/schemas/Mode'}
+        audio_id: {type: string, minLength: 1, description: Successful same-chat audio draft to consume. Omit for typed input.}
+    Message:
+      type: object
+      required: [id, chat_id, seq, role, text, status, created_at, request_id, mode, model_id]
+      properties:
+        id: {type: string}
+        chat_id: {type: string}
+        seq: {type: integer, minimum: 1}
+        role: {type: string, enum: [user, assistant]}
+        text: {type: string}
+        status: {type: string, enum: [complete, streaming, interrupted]}
+        created_at: {type: string, format: date-time}
+        request_id: {type: [string, 'null']}
+        mode: {type: [string, 'null'], enum: [listen, analyze, null]}
+        model_id: {type: [string, 'null']}
+    AudioJob:
+      type: object
+      required: [job_id, chat_id, audio_id, status, transcript, error, created_at]
+      properties:
+        job_id: {type: string}
+        chat_id: {type: string}
+        audio_id: {type: string}
+        status: {type: string, enum: [queued, running, succeeded, failed]}
+        transcript: {type: [string, 'null']}
+        error:
+          anyOf: [{$ref: '#/components/schemas/Error'}, {type: 'null'}]
+        created_at: {type: string, format: date-time}
+    Error:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        retryable: {type: boolean}
+    Memory:
+      type: object
+      required: [chat_id, summary, notes, last_answer]
+      properties:
+        chat_id: {type: string}
+        summary:
+          type: object
+          required: [text, version, covered_through_seq]
+          properties:
+            text: {type: string}
+            version: {type: integer, minimum: 0}
+            covered_through_seq: {type: integer, minimum: 0}
+        notes: {type: array, items: {$ref: '#/components/schemas/MemoryNote'}}
+        last_answer:
+          anyOf: [{$ref: '#/components/schemas/AnswerEvidence'}, {type: 'null'}]
+    Source:
+      type: object
+      required: [message_id, seq, excerpt, historical]
+      properties:
+        message_id: {type: string}
+        seq: {type: integer, minimum: 1, description: Fetch this message with before_seq set to seq plus one and limit set to one.}
+        excerpt: {type: string}
+        historical: {type: boolean, description: True when provided as superseded evidence.}
+    MemoryNote:
+      type: object
+      required: [id, text, kind, status, origin, observed_at, sources]
+      properties:
+        id: {type: string}
+        text: {type: string}
+        kind: {type: string, enum: [event, preference, open_topic, assumption, correction]}
+        status: {type: string, enum: [current, superseded]}
+        origin: {type: string, enum: [user, assistant], description: Who originally expressed the statement.}
+        observed_at: {type: string, format: date-time}
+        sources: {type: array, items: {$ref: '#/components/schemas/Source'}}
+    AnswerEvidence:
+      type: object
+      required: [message_id, summary_version, covered_through_seq, tail_seqs, retrieved]
+      properties:
+        message_id: {type: string}
+        summary_version: {type: integer, minimum: 0}
+        covered_through_seq: {type: integer, minimum: 0}
+        tail_seqs: {type: array, items: {type: integer, minimum: 1}}
+        retrieved: {type: array, items: {$ref: '#/components/schemas/Source'}}
