@@ -291,6 +291,7 @@ components:
         request_id: {type: [string, 'null']}
         mode: {type: [string, 'null'], enum: [listen, analyze, null]}
         model_id: {type: [string, 'null']}
+        audio_id: {type: [string, 'null'], description: Consumed draft ID on the user message, kept for exact request replay.}
     AudioJob:
       type: object
       required: [job_id, chat_id, audio_id, status, transcript, error, created_at]
