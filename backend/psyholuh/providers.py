@@ -1,15 +1,30 @@
 import asyncio
-import json
+import logging
 import re
+import sqlite3
 from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import httpx
 
 from . import config
+from .budget import (
+    CATEGORY,
+    ChargeScope,
+    charge_amount,
+    claim_due,
+    eligible,
+    observe,
+    release_unsent,
+    reserve,
+)
+from .db import read
 from .memory import CORRECTION, EVENT, WEEKDAY, chunks, clip_bytes, summary_cap
+from .pricing import API_ROOT, json_decimals, quote_request
 
-ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+LOGGER = logging.getLogger(__name__)
+ENDPOINT = f"{API_ROOT}/chat/completions"
 SUMMARY_RULES = (
     "Сожми предыдущую сводку и следующий последовательный отрывок в обновлённую "
     "сводку для личного диалога. Сохрани важные события, предпочтения, вопросы и "
@@ -35,8 +50,131 @@ def headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"}
 
 
+def provider_id(value) -> str | None:
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= 200
+        and value.isascii()
+        and value.isprintable()
+    ):
+        return value
+    return None
+
+
+@dataclass
+class Meter:
+    charge_id: str
+    generation_id: str | None = None
+    settled: bool = False
+
+    def record(self, packet: dict) -> None:
+        generation = self.generation_id or provider_id(packet.get("id"))
+        usage = packet.get("usage")
+        amount = None
+        if isinstance(usage, dict) and "cost" in usage:
+            try:
+                amount = charge_amount(usage["cost"])
+            except ValueError:
+                pass
+        if generation != self.generation_id or (
+            amount is not None and not self.settled
+        ):
+            observe(self.charge_id, generation, amount)
+        self.generation_id = generation
+        self.settled |= amount is not None
+
+
+@asynccontextmanager
+async def paid_response(
+    payload: dict, scope: ChargeScope, category: CATEGORY, timeout: int
+):
+    with read() as db:
+        scope.require_owner(db)
+        revision = eligible(db, payload["model"])
+    authorization = headers()
+    if payload["model"] != config.FREE_ROUTER:
+        payload = {**payload, "reasoning": {"enabled": False}}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=12)) as client:
+        quote = await quote_request(client, payload, revision)
+        request = client.build_request(
+            "POST",
+            ENDPOINT,
+            json={**payload, "provider": quote.routing},
+            headers=authorization,
+        )
+        meter = Meter(reserve(scope, category, payload["model"], quote))
+        try:
+            response = await client.send(request, stream=True)
+        except (httpx.PoolTimeout, httpx.ConnectTimeout, httpx.ConnectError):
+            # This attempt never established a connection to send the POST.
+            release_unsent(meter.charge_id)
+            raise
+        try:
+            meter.record(
+                {
+                    "id": response.headers.get("x-openrouter-generation-id")
+                    or response.headers.get("x-generation-id")
+                }
+            )
+            if response.is_error:
+                body = await response.aread()
+                try:
+                    packet = json_decimals(body)
+                    if isinstance(packet, dict):
+                        meter.record(packet)
+                except ValueError:
+                    pass
+                # These OpenRouter preflight statuses deny access or credits.
+                # All ambiguous upstream/transport failures retain the hold.
+                if (
+                    response.status_code in (401, 402)
+                    and not meter.generation_id
+                    and not meter.settled
+                ):
+                    release_unsent(meter.charge_id)
+                response.raise_for_status()
+            yield response, meter
+        finally:
+            await response.aclose()
+
+
+async def reconcile_costs_once() -> None:
+    if config.DEMO or not config.OPENROUTER_API_KEY:
+        return
+    pending = await asyncio.to_thread(claim_due)
+    if not pending:
+        return
+    async with httpx.AsyncClient(timeout=httpx.Timeout(8, connect=4)) as client:
+        for charge_id, generation in pending:
+            try:
+                response = await client.get(
+                    f"{API_ROOT}/generation",
+                    params={"id": generation},
+                    headers=headers(),
+                )
+                response.raise_for_status()
+                data = json_decimals(response.content)["data"]
+                if data.get("id", generation) == generation:
+                    observe(charge_id, generation, charge_amount(data["total_cost"]))
+            except (httpx.HTTPError, KeyError, TypeError, ValueError, AttributeError):
+                # Deleted, delayed, or unreachable generation details are not
+                # proof that a POST did not bill.
+                continue
+
+
+async def run_cost_reconciliation() -> None:
+    while True:
+        try:
+            await reconcile_costs_once()
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.warning(
+                "OpenRouter accounting lookup will retry (%s).", type(exc).__name__
+            )
+        await asyncio.sleep(10)
+
+
 async def openrouter_stream(
-    model: str, messages: list[dict[str, str]]
+    model: str, messages: list[dict[str, str]], scope: ChargeScope
 ) -> AsyncIterator[ReplyPart]:
     payload = {
         "model": model,
@@ -44,11 +182,7 @@ async def openrouter_stream(
         "max_tokens": config.RESPONSE_TOKENS,
         "stream": True,
     }
-    async with (
-        httpx.AsyncClient(timeout=httpx.Timeout(75, connect=12)) as client,
-        client.stream("POST", ENDPOINT, json=payload, headers=headers()) as response,
-    ):
-        response.raise_for_status()
+    async with paid_response(payload, scope, "reply", 75) as (response, meter):
         finished = False
         observed_model = None
         async for line in response.aiter_lines():
@@ -57,7 +191,8 @@ async def openrouter_stream(
             raw = line[5:].strip()
             if raw == "[DONE]":
                 return
-            frame = json.loads(raw)
+            frame = json_decimals(raw)
+            meter.record(frame)
             if frame.get("error"):
                 raise ProviderError("Модель вернула ошибку во время ответа.")
             reported_model = frame.get("model")
@@ -116,18 +251,18 @@ def demo_reply(messages: list[dict[str, str]], mode: str) -> str:
 
 
 async def reply(
-    model: str, messages: list[dict[str, str]], mode: str
+    model: str, messages: list[dict[str, str]], mode: str, scope: ChargeScope
 ) -> AsyncIterator[ReplyPart]:
     if config.DEMO:
         for fragment in re.findall(r"\S+\s*|\s+", demo_reply(messages, mode)):
             await asyncio.sleep(0.045)
             yield ReplyPart(text=fragment, model_id=model)
         return
-    async for fragment in openrouter_stream(model, messages):
+    async for fragment in openrouter_stream(model, messages, scope):
         yield fragment
 
 
-async def summarize(previous: str, batch: str) -> str:
+async def summarize(previous: str, batch: str, scope: ChargeScope) -> str:
     if config.DEMO:
         # Keep recent source-labelled statements and prefer explicit updates.
         lines = list(
@@ -161,10 +296,9 @@ async def summarize(previous: str, batch: str) -> str:
         },
     ]
     payload = {"model": config.SUMMARY_MODEL, "messages": messages, "max_tokens": 550}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(65, connect=12)) as client:
-        response = await client.post(ENDPOINT, json=payload, headers=headers())
-        response.raise_for_status()
-    data = response.json()
+    async with paid_response(payload, scope, "compression", 65) as (response, meter):
+        data = json_decimals(await response.aread())
+        meter.record(data)
     if data.get("error") or not data.get("choices"):
         raise ProviderError("Провайдер не вернул сводку.")
     text = data["choices"][0].get("message", {}).get("content")
@@ -173,7 +307,9 @@ async def summarize(previous: str, batch: str) -> str:
     return clip_bytes(text.strip(), summary_cap())
 
 
-async def compress(previous: str, records: Iterable[tuple[str, str]]) -> str:
+async def compress(
+    previous: str, records: Iterable[tuple[str, str]], scope: ChargeScope
+) -> str:
     # Cap each incremental request, including the previous output and framing.
     limit = (
         config.SUMMARY_CONTEXT
@@ -189,9 +325,9 @@ async def compress(previous: str, records: Iterable[tuple[str, str]]) -> str:
         for part in chunks(text, limit - label_bytes - 1):
             size = label_bytes + len(part.encode("utf-8")) + 1
             if pending_bytes + size > limit:
-                previous = await summarize(previous, "\n".join(pending))
+                previous = await summarize(previous, "\n".join(pending), scope)
                 pending.clear()
                 pending_bytes = 0
             pending.append(label + part)
             pending_bytes += size
-    return await summarize(previous, "\n".join(pending)) if pending else previous
+    return await summarize(previous, "\n".join(pending), scope) if pending else previous

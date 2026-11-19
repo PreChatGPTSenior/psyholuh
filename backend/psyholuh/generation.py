@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import sqlite3
 import time
@@ -11,6 +12,7 @@ import httpx
 from pydantic import BaseModel, Field, model_validator
 
 from . import config
+from .budget import BUDGET_CODES, ChargeScope
 from .db import (
     MESSAGE_FIELDS,
     APIError,
@@ -183,7 +185,11 @@ def append_fragment(attempt: Attempt, text: str) -> None:
 def complete_reply(attempt: Attempt, evidence: dict, actual_model: str) -> dict:
     with write() as db:
         changed = db.execute(
-            """UPDATE messages SET status='complete', completed_at=?, model_id=?, evidence=?, attempt_id=NULL, lease_until=NULL
+            """UPDATE messages SET status='complete', completed_at=?, model_id=?, evidence=?,
+                 reply_charge_id=(SELECT id FROM openrouter_charges
+                                  WHERE category='reply' AND assistant_id=messages.id AND openrouter_charges.attempt_id=messages.attempt_id
+                                  LIMIT 1),
+                 attempt_id=NULL, lease_until=NULL
                WHERE id=? AND status='streaming' AND attempt_id=? AND lease_until>?""",
             (
                 utc_now(),
@@ -305,9 +311,12 @@ def build_window(attempt: Attempt, user_text: str) -> Window | Checkpoint:
         return Checkpoint(memory_job(db, chat_id, summary, target))
 
 
-def job_status(job_id: str) -> str:
+def job_status(job_id: str) -> tuple[str, dict | None]:
     with read() as db:
-        return db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+        status, error = db.execute(
+            "SELECT status, error FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        return status, json.loads(error) if error else None
 
 
 async def prepare(attempt: Attempt, user_text: str) -> Window:
@@ -319,9 +328,11 @@ async def prepare(attempt: Attempt, user_text: str) -> Window:
         if not action.job_id:
             continue
         while True:
-            status = await asyncio.to_thread(job_status, action.job_id)
+            status, error = await asyncio.to_thread(job_status, action.job_id)
             if status == "succeeded":
                 break
+            if status == "failed" and error and error["code"] in BUDGET_CODES:
+                raise APIError(503, error["code"], error["message"], error["retryable"])
             if status == "failed" or time.monotonic() >= deadline:
                 raise APIError(
                     503,
@@ -348,6 +359,9 @@ async def produce(attempt: Attempt, output: asyncio.Queue) -> None:
 
     completed = False
     try:
+        scope = ChargeScope(
+            attempt.user["chat_id"], attempt.key, assistant_id=attempt.assistant["id"]
+        )
         await status("preparing_context")
         text = attempt.user["text"]
         long_threshold = (
@@ -359,7 +373,7 @@ async def produce(attempt: Attempt, output: asyncio.Queue) -> None:
         if cost(text) > long_threshold:
             await status("processing_long_message")
             seq = attempt.user["seq"]
-            shortened = await compress("", [(f"№{seq} (user): ", text)])
+            shortened = await compress("", [(f"№{seq} (user): ", text)], scope)
             text = (
                 f"Сжатое содержание длинной реплики пользователя №{seq}:\n{shortened}"
             )
@@ -368,7 +382,9 @@ async def produce(attempt: Attempt, output: asyncio.Queue) -> None:
         has_output = False
         selected_model = attempt.assistant["model_id"]
         actual_model = selected_model
-        async for part in reply(selected_model, window.messages, attempt.user["mode"]):
+        async for part in reply(
+            selected_model, window.messages, attempt.user["mode"], scope
+        ):
             if part.model_id:
                 actual_model = part.model_id
             if part.text:

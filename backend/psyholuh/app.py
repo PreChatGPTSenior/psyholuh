@@ -1,5 +1,6 @@
+import asyncio
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated
 
@@ -9,6 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import config
+from .budget import budget_view, chat_costs, parse_limit, update_budget
 from .db import (
     MESSAGE_FIELDS,
     APIError,
@@ -36,6 +38,7 @@ from .jobs import (
     retry_audio,
 )
 from .memory import memory_view
+from .providers import run_cost_reconciliation
 
 AUDIO_SUFFIXES = {"wav", "mp3", "m4a", "mp4", "ogg", "webm"}
 AUDIO_TYPES = {
@@ -61,11 +64,24 @@ class NewChat(BaseModel):
     title: str = Field(default="Новая беседа", min_length=1, max_length=120)
 
 
+class BudgetSettings(BaseModel):
+    limit_usd: str = Field(strict=True, max_length=17)
+
+
 @asynccontextmanager
 async def startup(_: FastAPI):
     initialize()
     seed()
-    yield
+    task = None
+    if not config.DEMO and config.OPENROUTER_API_KEY:
+        task = asyncio.create_task(run_cost_reconciliation())
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(
@@ -255,6 +271,26 @@ def get_memory(chat_id: str):
     with read() as db:
         get_chat(db, chat_id)
         return memory_view(db, chat_id)
+
+
+@api.get("/settings/budget")
+def get_budget():
+    with read() as db:
+        return budget_view(db)
+
+
+@api.put("/settings/budget")
+def set_budget(body: BudgetSettings):
+    limit = parse_limit(body.limit_usd)
+    with write() as db:
+        return update_budget(db, limit)
+
+
+@api.get("/chats/{chat_id}/costs")
+def get_costs(chat_id: str):
+    with read() as db:
+        get_chat(db, chat_id)
+        return chat_costs(db, chat_id)
 
 
 app.include_router(api)

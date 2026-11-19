@@ -237,7 +237,10 @@ def schedule_background(db: sqlite3.Connection, chat_id: str, before_seq: int) -
     if target:
         job = db.execute(
             """SELECT 1 FROM jobs WHERE chat_id=? AND kind='memory' AND base_version=?
-               AND target_seq>=? AND status IN ('queued', 'running')""",
+               AND ((target_seq>=? AND status IN ('queued', 'running'))
+                    OR (status='failed' AND budget_denial_revision=(
+                        SELECT openrouter_budget_revision FROM installation WHERE id=1
+                    )))""",
             (chat_id, summary["version"], target[0]),
         ).fetchone()
         if job is None:
